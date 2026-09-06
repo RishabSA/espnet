@@ -265,6 +265,67 @@ class WhisperEngine:
             prompt=prompt,
         )[0]
 
+    def score_texts(
+        self,
+        audio: torch.Tensor,
+        texts: list[str],
+        focuses: list[tuple[int, int] | None] | None = None,
+        language: str = "en",
+    ) -> list[dict]:
+        # teacher-forced scoring of several texts over one audio window: one encoder pass, the
+        # decoder sub-batched; each focus is a character range in its text whose token logprobs
+        # are summed separately (spec section 6.8, canonicalizer b)
+        tokenizer = self._tokenizer_for(language)
+        special = self._primer(language, None)
+        # leading space matches Whisper's own output convention for mid-transcript words
+        ids = [tokenizer.encode(" " + t.strip()) for t in texts]
+        seqs = [special + t + [tokenizer.eot] for t in ids]
+        width = max(len(q) for q in seqs)
+        # right padding with eot is inert: attention is causal, so real positions never see it
+        padded = torch.tensor([q + [tokenizer.eot] * (width - len(q)) for q in seqs], device=self.device)
+
+        enc = self._encode([audio])
+        token_lp = self._token_logprobs(enc.expand(len(seqs), -1, -1), padded)  # shape: (n, width - 1)
+
+        results = []
+        for k, text_ids in enumerate(ids):
+            # text token j occupies decoder position len(special) + j, so target index
+            # len(special) + j - 1
+            text_lp = token_lp[k, len(special) - 1 : len(special) - 1 + len(text_ids)]
+            result = {
+                "sum_all": text_lp.sum().item(),
+                "mean_all": text_lp.mean().item(),
+                "n_tokens": len(text_ids),
+            }
+            focus = focuses[k] if focuses is not None else None
+            if focus is not None:
+                # character offsets in the prefixed string, rebuilt from token bytes since
+                # tiktoken has no offset mapping; a piece boundary inside a multi-byte
+                # character floors to the previous character, which only fuzzes non-ASCII
+                starts, ends = [], []
+                grown = b""
+                for tok_id in text_ids:
+                    starts.append(len(grown.decode("utf-8", errors="ignore")))
+                    grown += tokenizer.encoding.decode_single_token_bytes(tok_id)
+                    ends.append(len(grown.decode("utf-8", errors="ignore")))
+                # offsets are relative to the prefixed string, shift the caller's range by 1
+                lo, hi = focus[0] + 1, focus[1] + 1
+                idx = [j for j, (st, en) in enumerate(zip(starts, ends, strict=True)) if st < hi and en > lo]
+                if not idx:
+                    raise ValueError(
+                        f"focus range {focus} selects no tokens in text of length {len(texts[k])}"
+                    )
+                focus_lp = text_lp[idx]
+                result.update(
+                    {
+                        "sum_focus": focus_lp.sum().item(),
+                        "mean_focus": focus_lp.mean().item(),
+                        "n_focus_tokens": len(idx),
+                    }
+                )
+            results.append(result)
+        return results
+
     def score_text(
         self,
         audio: torch.Tensor,
@@ -272,56 +333,7 @@ class WhisperEngine:
         focus: tuple[int, int] | None = None,
         language: str = "en",
     ) -> dict:
-        # teacher-forced scoring of arbitrary text; focus is a character range in text
-        # whose token logprobs are summed separately (spec section 6.8, canonicalizer b)
-        tokenizer = self._tokenizer_for(language)
-
-        # leading space matches Whisper's own output convention for mid-transcript words
-        prefixed = " " + text.strip()
-        text_ids = tokenizer.encode(prefixed)
-
-        special = self._primer(language, None)
-        sequence = torch.tensor([special + text_ids + [tokenizer.eot]], device=self.device)
-
-        enc = self._encode([audio])
-        token_lp = self._token_logprobs(enc, sequence)[0]  # shape: (seq - 1,)
-
-        # text token j occupies decoder position len(special) + j, so target index
-        # len(special) + j - 1
-        text_lp = token_lp[len(special) - 1 : len(special) - 1 + len(text_ids)]
-        result = {
-            "sum_all": text_lp.sum().item(),
-            "mean_all": text_lp.mean().item(),
-            "n_tokens": len(text_ids),
-        }
-
-        if focus is not None:
-            # character offsets in the prefixed string, rebuilt from token bytes since
-            # tiktoken has no offset mapping; a piece boundary inside a multi-byte
-            # character floors to the previous character, which only fuzzes non-ASCII
-            starts, ends = [], []
-            grown = b""
-            for tok_id in text_ids:
-                starts.append(len(grown.decode("utf-8", errors="ignore")))
-                grown += tokenizer.encoding.decode_single_token_bytes(tok_id)
-                ends.append(len(grown.decode("utf-8", errors="ignore")))
-
-            # offsets are relative to the prefixed string, shift the caller's range by 1
-            lo, hi = focus[0] + 1, focus[1] + 1
-            idx = [j for j, (s, e) in enumerate(zip(starts, ends, strict=True)) if s < hi and e > lo]
-            if not idx:
-                raise ValueError(
-                    f"focus range {focus} selects no tokens in text of length {len(text)}"
-                )
-            focus_lp = text_lp[idx]
-            result.update(
-                {
-                    "sum_focus": focus_lp.sum().item(),
-                    "mean_focus": focus_lp.mean().item(),
-                    "n_focus_tokens": len(idx),
-                }
-            )
-        return result
+        return self.score_texts(audio, [text], [focus], language)[0]
 
     def biased_decode(
         self,
