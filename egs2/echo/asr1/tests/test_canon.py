@@ -63,6 +63,22 @@ def test_select_reproduces_the_worked_example():
     assert r["delta_null"] == pytest.approx(-0.19 / 7)
     # the top-1 aggregation is the per-utterance scorer of the prior art; the most confident occurrence is 6
     assert select(per_occ, own, confs, "mean_token", "top1")["canonical_norm"] == "kowalski"
+    # robust aggregations: kowalski loses the median and the win count (it wins only 2 of 7) but keeps
+    # the clipped sum, and one wild occurrence cannot swing the median
+    assert select(per_occ, own, confs, "mean_token", "median")["canonical_norm"] == "kowalsky"
+    assert select(per_occ, own, confs, "mean_token", "wins")["canonical_norm"] == "kowalsky"
+    # clipping the per-occurrence advantage at 0.05 removes the wide wins that carry kowalski;
+    # a clip above the largest delta leaves the sum-of-deltas ordering intact
+    assert select(per_occ, own, confs, "mean_token", "clip:0.05")["canonical_norm"] == "kowalsky"
+    assert select(per_occ, own, confs, "mean_token", "clip:0.5")["canonical_norm"] == "kowalski"
+    wild = {v: [list(r) for r in rows] for v, rows in per_occ.items()}
+    wild["covalski"][3] = [-0.01 * 4, 4]
+    assert select(wild, own, confs, "mean_token", "sum")["canonical_norm"] == "kowalski"
+    wild["covalski"][3] = [8.0 * 4, 4]
+    assert select(wild, own, confs, "mean_token", "sum")["canonical_norm"] == "covalski"
+    assert select(wild, own, confs, "mean_token", "median")["canonical_norm"] == "kowalsky"
+    with pytest.raises(ValueError):
+        select(per_occ, own, confs, "mean_token", "bogus")
 
 
 def test_length_norm_confound():
@@ -89,13 +105,20 @@ def test_splice_keeps_punctuation_and_masks_cooccurring():
     assert text == "met (Kaifu Lee), yesterday" and text[focus[0] : focus[1]] == "Kaifu Lee"
     text, focus = splice(words, list(range(5)), [0, 0], "Met", [])
     assert text == "Met (Kai Fu Lee), yesterday" and focus == (0, 3)
+    # the occurrence's possessive is re-attached outside the focus, so "Nexstar's" and "Nextar"
+    # are scored with the same morphology the audio carries
+    words = [{"word": w, "start": float(i), "end": i + 0.5, "chunk_id": 0} for i, w in enumerate(["we", "saw", "Nexstar's,", "results"])]
+    text, focus = splice(words, list(range(4)), [2, 2], "Nextar", [], "'s")
+    assert text == "we saw Nextar's, results" and text[focus[0] : focus[1]] == "Nextar"
 
 
 def test_nbest_variants():
     words = [{"word": w, "start": float(i), "end": i + 0.5, "chunk_id": 0, "idx": i} for i, w in enumerate(["we", "met", "Pemsa", "today"])]
     records = [{"doc_id": "d", "chunk_id": 0, "start": 0.0, "end": 4.0, "hyps": [
-        {"rank": 0, "text": "we met Pemsa today"}, {"rank": 1, "text": "we met Femsa today"}, {"rank": 2, "text": "we met Pemsa today."}, {"rank": 3, "text": "we met today"}]}]
+        {"rank": 0, "text": "we met Pemsa today"}, {"rank": 1, "text": "we met Femsa today"}, {"rank": 2, "text": "we met Pemsa today."}, {"rank": 3, "text": "we met today"},
+        {"rank": 4, "text": "we met Pemsa Corp today"}, {"rank": 5, "text": "we met Femsa's today"}]}]
     m = {"occ_id": "d#c0#w0002", "chunk_id": 0, "word_span": [2, 2], "surface": "Pemsa", "norm": "pemsa", "start": 2.0, "end": 2.5, "conf": -0.5}
+    # a two-word alternative is not a spelling of a one-word span; possessives fold onto the base
     assert nbest_variants([m], records, words) == {"pemsa": "Pemsa", "femsa": "Femsa"}
 
 
@@ -140,6 +163,12 @@ def test_a0_reproduces_fixture_pass2_and_empty_lexicon_is_identity():
     assert [(e["from"], e["to"], e["occ_id"]) for e in out[0]["edits"]] == [("Kowalsky", "Kowalski", "d1#c0#w0012"), ("Kowalsky", "Kowalski", "d1#c0#w0029")]
     same, same_text = apply_a0(records, word_records, cands, [])
     assert same_text == records[0]["hyps"][0]["text"] and same[0]["edits"] == []
+    # a possessive occurrence keeps its possessive when the bare canonical is substituted
+    word_records2 = [{"chunk_id": 0, "words": [{"word": w, "stitched": True} for w in ["we", "saw", "Nexstar's,", "and", "Nextar", "grew"]]}]
+    records2 = [{"doc_id": "x", "chunk_id": 0, "start": 0.0, "end": 3.0, "hyps": [{"rank": 0, "text": "we saw Nexstar's, and Nextar grew"}]}]
+    cands2 = {"x#c0#w0002": {"word_span": [2, 2], "surface": "Nexstar's"}, "x#c0#w0004": {"word_span": [4, 4], "surface": "Nextar"}}
+    out2, text2 = apply_a0(records2, word_records2, cands2, [{"cluster_id": "c", "canonical": "Nexstar", "canonical_norm": "nexstar", "occ_ids": ["x#c0#w0002", "x#c0#w0004"]}])
+    assert text2 == "we saw Nexstar's, and Nexstar grew" and [e["occ_id"] for e in out2[0]["edits"]] == ["x#c0#w0004"]
 
 
 def test_eval_lexicon_scores_the_vote_on_the_fixture():

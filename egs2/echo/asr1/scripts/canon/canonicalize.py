@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import statistics
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -16,7 +17,7 @@ from scripts.analysis.e1_windows import stitched_words
 from scripts.common.align import align_doc, realize
 from scripts.common.audio import load_audio, slice_audio
 from scripts.common.io import append_config, read_jsonl
-from scripts.mine.mine_candidates import word_norm
+from scripts.mine.mine_candidates import clean_word, possessive_re, word_norm
 
 # canonicalizer (a): posterior weights clipped so a near-zero-confidence mention still counts
 weight_floor, weight_ceiling = 0.05, 1.0
@@ -36,11 +37,19 @@ def vote(mentions: list[dict]) -> tuple[str, dict[str, float]]:
 
 
 def surfaces_by_norm(mentions: list[dict]) -> dict[str, str]:
-    # each normalized spelling's most frequent surface: the cased form spliced into text
+    # each normalized spelling's most frequent surface with the possessive removed: the cased
+    # form spliced into text; each occurrence re-attaches its own possessive at splice time
     counts = defaultdict(Counter)
     for m in mentions:
-        counts[m["norm"]][m["surface"]] += 1
+        counts[m["norm"]][possessive_re.sub("", m["surface"])] += 1
     return {n: c.most_common(1)[0][0] for n, c in counts.items()}
+
+
+def possessive_of(mention: dict, words: list[dict]) -> str:
+    # the occurrence's own possessive suffix, if any, so every variant is scored with the same
+    # morphology the audio carries at that occurrence
+    found = possessive_re.search(clean_word(words[mention["word_span"][1]]["word"]))
+    return found.group(0) if found else ""
 
 
 def nbest_variants(mentions: list[dict], records: list[dict], words: list[dict]) -> dict[str, str]:
@@ -59,9 +68,12 @@ def nbest_variants(mentions: list[dict], records: list[dict], words: list[dict])
             r = realize(cache[key], local)
             if r is None:
                 continue
-            norm = norm_of(r.surface)
-            if norm:
-                found[norm][r.surface] += 1
+            # an alternative that dropped or added a word is not a spelling of this span: a
+            # truncation leaves audio unexplained that focus-only scoring never charges for
+            surface = possessive_re.sub("", r.surface)
+            norm = norm_of(surface)
+            if norm and len(surface.split()) == b - a + 1:
+                found[norm][surface] += 1
     return {n: c.most_common(1)[0][0] for n, c in found.items()}
 
 
@@ -74,10 +86,10 @@ def window(mention: dict, chunk_words: list[int], words: list[dict], chunk: dict
     return s, e, idx
 
 
-def splice(words: list[dict], idx: list[int], span: list[int], variant: str, masked: list[list[int]]) -> tuple[str, tuple[int, int]]:
+def splice(words: list[dict], idx: list[int], span: list[int], variant: str, masked: list[list[int]], suffix: str = "") -> tuple[str, tuple[int, int]]:
     # window text with the occurrence's span replaced by the variant (keeping the span's edge
-    # punctuation) and co-occurring mentions of the same cluster removed; returns the text and
-    # the variant's character range in it
+    # punctuation and its possessive suffix) and co-occurring mentions of the same cluster
+    # removed; returns the text and the variant's character range in it (suffix excluded)
     a, b = span
     hidden = {i for x, y in masked for i in range(x, y + 1)}
     before = [words[i]["word"] for i in idx if i < a and i not in hidden]
@@ -86,7 +98,7 @@ def splice(words: list[dict], idx: list[int], span: list[int], variant: str, mas
     trail = edge_re.match(words[b]["word"]).group(3)
     head = " ".join(before)
     lo = len(head) + (1 if head else 0) + len(lead)
-    text = " ".join(x for x in [head, lead + variant + trail, " ".join(after)] if x)
+    text = " ".join(x for x in [head, lead + variant + suffix + trail, " ".join(after)] if x)
     return text, (lo, lo + len(variant))
 
 
@@ -103,14 +115,25 @@ def normalized(sum_lp: float, n_tok: int, length_norm: str) -> float:
 def select(per_occ: dict[str, list[list]], own: list[str], conf: list[float], length_norm: str, aggregate: str) -> dict:
     # per_occ[variant][i] = [focus logprob sum, focus token count] for occurrence i; own[i] is the
     # occurrence's pass-1 spelling, whose score is the null reference s_0(i) (spec 5.8)
-    scores = {v: [normalized(s, n, length_norm) for s, n in rows] for v, rows in per_occ.items()}
+    scores = {v: [normalized(r[0], r[1], length_norm) for r in rows] for v, rows in per_occ.items()}
+    n = len(own)
     if aggregate == "sum":
         totals = {v: sum(x) for v, x in scores.items()}
     elif aggregate == "top1":
-        star = max(range(len(conf)), key=lambda i: conf[i])
+        star = max(range(n), key=lambda i: conf[i])
         totals = {v: x[star] for v, x in scores.items()}
+    elif aggregate == "median":
+        # robust to one occurrence whose window supports no variant (excision or timestamp failure)
+        totals = {v: statistics.median(x) * n for v, x in scores.items()}
+    elif aggregate == "wins":
+        # per-occurrence voting on the acoustic scores, ties broken by the summed score
+        totals = {v: sum(x[i] == max(y[i] for y in scores.values()) for i in range(n)) + sum(x) / (n * 1000.0) for v, x in scores.items()}
+    elif aggregate.startswith("clip:"):
+        # per-occurrence advantage over the occurrence's own pass-1 spelling clipped to +-c
+        c = float(aggregate.split(":", 1)[1])
+        totals = {v: sum(max(-c, min(c, x[i] - scores[own[i]][i])) for i in range(n)) for v, x in scores.items()}
     else:
-        raise ValueError(f"unknown aggregate {aggregate!r}: expected sum or top1")
+        raise ValueError(f"unknown aggregate {aggregate!r}: expected sum, top1, median, wins, or clip:<c>")
     ranked = sorted(totals, key=lambda v: (-totals[v], v))
     best = ranked[0]
     margin = totals[best] - totals[ranked[1]] if len(ranked) > 1 else None
@@ -119,8 +142,8 @@ def select(per_occ: dict[str, list[list]], own: list[str], conf: list[float], le
             "margin_per_occ": margin / len(own) if margin is not None else None, "delta_null": delta_null}
 
 
-def engine_scorer(engine, audio, s: float, e: float, texts: list[str], focuses: list[tuple[int, int]]) -> list[tuple[float, int]]:
-    return [(r["sum_focus"], r["n_focus_tokens"]) for r in engine.score_texts(slice_audio(audio, s, e), texts, focuses)]
+def engine_scorer(engine, audio, s: float, e: float, texts: list[str], focuses: list[tuple[int, int]]) -> list[tuple[float, int, float, int]]:
+    return [(r["sum_focus"], r["n_focus_tokens"], r["sum_all"], r["n_tokens"]) for r in engine.score_texts(slice_audio(audio, s, e), texts, focuses)]
 
 
 def canonicalize_doc(doc_id: str, clusters: dict, cands: list[dict], words: list[dict], records: list[dict],
@@ -164,9 +187,11 @@ def canonicalize_doc(doc_id: str, clusters: dict, cands: list[dict], words: list
         for m, span in zip(mentions, spans, strict=True):
             s, e, idx = window(m, chunk_index[m["chunk_id"]], words, chunks[m["chunk_id"]], params["context_window_s"], params["pad_s"])
             masked = [sp for sp in spans if sp != span and idx and idx[0] <= sp[0] and sp[1] <= idx[-1]] if params["mask_cooccurring"] else []
-            texts, focuses = zip(*[splice(words, idx, span, pool[n], masked) for n in norms], strict=True)
-            for n, (lp, ntok) in zip(norms, scorer(s, e, list(texts), list(focuses)), strict=True):
-                per_occ[n].append([lp, ntok])
+            suffix = possessive_of(m, words)
+            texts, focuses = zip(*[splice(words, idx, span, pool[n], masked, suffix) for n in norms], strict=True)
+            # rows are [focus sum, focus tokens, window sum, window tokens]; a stub scorer may give two
+            for n, row in zip(norms, scorer(s, e, list(texts), list(focuses)), strict=True):
+                per_occ[n].append(list(row))
             cost["n_windows"] += 1
             cost["n_forwards"] += len(norms)
             cost["scored_audio_s"] += e - s
@@ -197,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-window-s", type=float, default=5.0, help="Context W on each side of the occurrence for (b) (default: 5.0).")
     parser.add_argument("--pad-s", type=float, default=0.5, help="Extra audio pad on the window edges for timestamp noise (default: 0.5).")
     parser.add_argument("--length-norm", type=str, default="mean_token", help="mean_token, sum, or penalty:<alpha> for the recorded canonical (default: mean_token).")
-    parser.add_argument("--aggregate", type=str, default="sum", choices=["sum", "top1"], help="Aggregate scores over occurrences (the method) or take the highest-confidence occurrence only (default: sum).")
+    parser.add_argument("--aggregate", type=str, default="sum", help="sum (the method), top1 (highest-confidence occurrence only), median, wins, or clip:<c> (default: sum).")
     parser.add_argument("--expand-nbest", action="store_true", help="Add losing n-best spellings at each occurrence to the variant pool (default: False).")
     parser.add_argument("--no-mask-cooccurring", action="store_true", help="Leave other mentions of the same cluster inside the window text; the ablation (default: False).")
     parser.add_argument("--max-clusters", type=int, default=0, help="Score at most this many clusters per doc, for smokes; 0 means all (default: 0).")

@@ -8,6 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from scripts.common.io import append_config, create_run_dir, read_jsonl, write_jsonl
+from scripts.mine.mine_candidates import possessive_re
 
 edge_re = re.compile(r"^(\W*)(.*?)(\W*)$", re.DOTALL)
 
@@ -31,9 +32,12 @@ def apply_a0(records: list[dict], word_records: list[dict], cands: dict[str, dic
             lead, trail = edge_re.match(raw_first).group(1), edge_re.match(raw_last).group(3)
             core = " ".join(x for x in chunk_words[chunk][first : last + 1] if x is not None)
             core = edge_re.match(core).group(2)
-            if core == entry["canonical"]:
+            # the occurrence keeps its own possessive; the canonical is the bare spelling
+            found = possessive_re.search(core)
+            suffix = found.group(0) if found else ""
+            if core == entry["canonical"] + suffix:
                 continue
-            chunk_words[chunk][first] = lead + entry["canonical"] + trail
+            chunk_words[chunk][first] = lead + entry["canonical"] + suffix + trail
             for j in range(first + 1, last + 1):
                 chunk_words[chunk][j] = None
             edits[chunk].append({"occ_id": occ_id, "from": m["surface"], "to": entry["canonical"], "cluster_id": entry["cluster_id"], "reason": "a0"})

@@ -130,7 +130,7 @@ if __name__ == "__main__":
     parser.add_argument("--docs", type=str, default="", help="Comma-separated doc ids overriding the manifest lookup (default: manifest split).")
     parser.add_argument("--length-norm", type=str, default="", help="Replay the choice under mean_token, sum or penalty:<alpha>; empty keeps the recorded choice (default: recorded).")
     parser.add_argument("--observed-only", action="store_true", help="Replay with n-best-expanded variants removed from the pool (default: False).")
-    parser.add_argument("--aggregate", type=str, default="", choices=["", "sum", "top1"], help="Replay with sum or top1 aggregation; empty keeps the recorded choice (default: recorded).")
+    parser.add_argument("--aggregate", type=str, default="", help="Replay with sum, top1, median, wins, or clip:<c> aggregation; empty keeps the recorded choice (default: recorded).")
     parser.add_argument("--tag", type=str, default="", help="Suffix for the metrics dir when replaying, e.g. sum or top1 (default: none).")
     args = parser.parse_args()
 
